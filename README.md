@@ -2,6 +2,8 @@
 
 一个受 WebGL / GLSL 视觉实验启发的网速仪表 UI 原型。页面用实时着色器绘制半圆仪表、折射玻璃数字方块和可交互的凝胶进度条，不依赖图片素材或第三方前端框架。
 
+[在线体验 · GitHub Pages](https://jdb156158.github.io/InternetSpeed/gel-glass.html)
+
 ![Gel Glass demo](assets/gel-glass-demo.gif)
 
 ## 功能
@@ -41,6 +43,14 @@ http://127.0.0.1:5174/gel-glass.html
 ```
 
 也可以直接双击 `gel-glass.html`，但部分浏览器对本地文件的 WebGL 调试信息会更少，推荐使用静态服务器。
+
+## GitHub Pages 部署
+
+仓库配置 GitHub Pages 后，体验地址为：
+
+<https://jdb156158.github.io/InternetSpeed/gel-glass.html>
+
+如果地址暂时返回 404，请在仓库的 **Settings → Pages** 中将部署来源设置为 `main` 分支的根目录（`/(root)`），保存后等待 GitHub 完成构建。
 
 ## 操作方式
 
