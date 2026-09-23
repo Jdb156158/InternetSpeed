@@ -5,27 +5,36 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>凝胶玻璃 · Gel Glass</title>
 <style>
-  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#050506; }
+  html, body {
+    margin:0; padding:0; height:100%; overflow:hidden;
+    background:radial-gradient(circle at 50% 42%, #111114 0, #050506 48%, #010102 100%);
+  }
   #gl { width:100vw; height:100vh; display:block; touch-action:none; }
   .hud {
     position:fixed; font-family:ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    color:rgba(235,235,240,.38); letter-spacing:.14em; font-size:10px;
+    color:rgba(235,235,240,.34); letter-spacing:.16em; font-size:10px;
     user-select:none; pointer-events:none; text-transform:uppercase;
   }
-  #tl { top:18px; left:22px; line-height:1.8; }
-  #tl b { color:rgba(255,150,50,.75); font-weight:600; }
+  #tl { top:20px; left:24px; line-height:1.85; }
+  #tl b { color:rgba(255,145,55,.86); font-weight:600; text-shadow:0 0 14px rgba(255,95,25,.35); }
   #br { bottom:16px; right:22px; text-align:right; }
   #val {
     position:fixed; right:22px; top:18px; font-family:ui-monospace,"SF Mono",Menlo,monospace;
-    color:rgba(255,140,40,.8); font-size:12px; letter-spacing:.3em; user-select:none; pointer-events:none;
+    color:rgba(255,140,45,.9); font-size:12px; letter-spacing:.3em; user-select:none; pointer-events:none;
+    text-shadow:0 0 14px rgba(255,85,20,.45);
   }
   #err { position:fixed; inset:0; display:none; place-items:center; color:#f66; font:14px monospace; white-space:pre-wrap; }
+  @media (max-width: 640px) {
+    #tl { top:14px; left:16px; }
+    #val { top:14px; right:16px; }
+    #br { bottom:12px; right:16px; max-width:72vw; line-height:1.6; }
+  }
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 <div class="hud" id="tl"><b>GEL GLASS</b><br>shader · 2d/3d · realtime</div>
-<div class="hud" id="br">拖动滑块 · 按压凝胶 · 点按立方体</div>
+<div class="hud" id="br">拖动滑块 · 按压凝胶 · 拖动方块旋转</div>
 <div id="val">000</div>
 <div id="err"></div>
 <script>
@@ -47,6 +56,7 @@ uniform vec2  uRes;
 uniform float uTime;
 uniform float uValue;    // 平滑后的 0..1
 uniform float uPoke;     // 立方体被戳的角度
+uniform vec2  uRot;      // pointer-driven yaw / pitch
 uniform float uDown;     // 播放头拖拽热度
 uniform float uDbg;
 uniform vec4  uDents[8]; // x, y, strength, unused
@@ -54,13 +64,14 @@ uniform vec4  uDents[8]; // x, y, strength, unused
 #define PI 3.14159265
 
 // 正交相机：世界 xy 即屏幕坐标
-const vec3 CUBE_C = vec3(0.0, 0.30, 0.0);
+const vec3 CUBE_C = vec3(0.0, -0.12, 0.0);
 const vec3 CUBE_B = vec3(0.27);
-const float CUBE_R = 0.07;
-const vec3 BAR_C  = vec3(0.0, -0.62, 0.0);
-const vec3 BAR_B  = vec3(0.80, 0.105, 0.105);
+const float CUBE_R = 0.085;
+const vec3 BAR_C  = vec3(0.0, -0.73, 0.0);
+const vec3 BAR_B  = vec3(0.88, 0.145, 0.115);
 const float BAR_R = 0.095;
-const vec2 G_C = vec2(0.0, 0.40);
+// The reference leaves a generous grid margin above the complete half dial.
+const vec2 G_C = vec2(0.0, 0.04);
 
 float gRotY, gRotX; // 立方体旋转（全局，供 map 与 local 变换共用）
 
@@ -111,9 +122,18 @@ vec2 map(vec3 p){
   vec3 q = p - CUBE_C;
   q.xz = rot(gRotY) * q.xz;
   q.yz = rot(gRotX) * q.yz;
+  // A subtle pressure-driven volume wobble keeps the cube from reading as rigid glass.
+  float wobble = sin(q.y*9.0 + uTime*2.1)*sin(q.x*8.0-uTime*1.7);
+  q *= vec3(1.0 + 0.035*wobble, 1.0 - 0.028*wobble, 1.0 + 0.025*wobble);
+  q.y += 0.018*sin(q.x*10.0 + uTime*2.4) * (0.35 + abs(uPoke)*1.8);
   float dc = sdRoundBox(q, CUBE_B, CUBE_R);
   vec3 b = p - BAR_C;
-  float db = sdRoundBox(b, BAR_B, BAR_R) + dentField(b)*0.11;
+  float playX = mix(-0.615, 0.615, clamp(uValue,0.,1.));
+  float pull = exp(-52.0*(b.x-playX)*(b.x-playX));
+  float cloth = (sin(b.x*18.0+uTime*0.7)*0.008 + sin(b.x*39.0-uTime)*0.003)*uDown;
+  b.y -= cloth + pull*0.075*uDown;
+  b.z += sin(b.x*14.0+uTime)*0.012*(0.25+uDown);
+  float db = sdRoundBox(b, BAR_B, BAR_R) + dentField(b)*0.10;
   return dc<db ? vec2(dc,1.0) : vec2(db,2.0);
 }
 vec3 cubeLocal(vec3 w){
@@ -132,11 +152,15 @@ vec3 calcNormal(vec3 p){
 
 // ---------- 背景（场景 uv：网格 + 仪表盘） ----------
 vec3 gridLayer(vec2 uv){
-  vec3 col = vec3(0.026,0.027,0.031);
+  vec3 col = vec3(0.020,0.021,0.025);
   vec2 g = uv/0.115;
   vec2 gf = abs(fract(g)-0.5)/fwidth(g);
   float line = 1.0 - min(min(gf.x,gf.y),1.0);
-  col += vec3(0.10,0.105,0.12) * line * 0.55;
+  vec2 sg = uv/0.0575;
+  vec2 sgf = abs(fract(sg)-0.5)/fwidth(sg);
+  float sub = 1.0-min(min(sgf.x,sgf.y),1.0);
+  col += vec3(0.075,0.08,0.095) * line * 0.48;
+  col += vec3(0.035,0.038,0.05) * sub * 0.32;
   return col;
 }
 float tickField(vec2 p, float n, float majorEvery, float r0, float r1, float w){
@@ -165,22 +189,22 @@ vec3 gaugeLayer(vec2 uv){
     vec3 gray = vec3(0.42,0.44,0.47);
     vec3 org  = vec3(1.0, 0.52, 0.10);
     // 刻度
-    float tm = tickField(p, 50., 5., 0.665, 0.712, 0.0035);
+    float tm = tickField(p, 50., 5., 0.565, 0.612, 0.0035);
     float filled = step(u, v);
     acc += gray * tm * (1.-filled) * 0.9;
     acc += org  * tm * filled * 1.4;
     // 进度弧（外亮 + 内淡）+ 全周淡弧
-    float arcBand = abs(r-0.545);
+    float arcBand = abs(r-0.485);
     float aOn = step(u, v);
     float arc = exp(-arcBand*arcBand*9000.0) * aOn * step(0.0,p.y+0.02);
     acc += org * arc * 1.3;
-    float arcBand2 = abs(r-0.44);
+    float arcBand2 = abs(r-0.355);
     acc += org * exp(-arcBand2*arcBand2*16000.0) * aOn * 0.55 * step(0.0,p.y+0.02);
     // 淡全弧
     acc += gray * exp(-arcBand*arcBand*16000.0) * 0.16 * step(0.0,p.y+0.02);
     // 指针
     float du = abs(u - v)*PI*r;
-    float needle = exp(-du*du*260000.0) * smoothstep(0.06,0.12,r)*(1.-smoothstep(0.52,0.60,r));
+    float needle = exp(-du*du*260000.0) * smoothstep(0.06,0.12,r)*(1.-smoothstep(0.46,0.52,r));
     acc += org * needle * (1.3 - (r-0.1)) * mix(0.25, 1.0, v);
     // 中心点
     acc += org * exp(-r*r*4000.0)*0.5 * step(0.0,p.y);
@@ -225,16 +249,22 @@ float digit7(vec2 p, float d){
   if(c) m=min(m,segGlow(p,vec2( 0.24,-0.23),vec2(w,0.16)));
   return 1.0 - smoothstep(0.0, 0.03, m);
 }
-vec3 digitsLayer(vec2 uv){
-  float val = floor(clamp(uValue,0.,1.)*100.0+0.5);
+float cubeFaceDigits(vec3 q){
+  vec3 aq=abs(q);
+  vec2 f;
+  if(aq.z>aq.x && aq.z>aq.y) f=vec2(q.x,q.y);
+  else if(aq.x>aq.y)          f=vec2(q.z,q.y);
+  else                        f=vec2(q.x,q.z);
+  if((aq.z>aq.x && q.z<0.0) || (aq.x>=aq.z && aq.x>aq.y && q.x>0.0)) f.x=-f.x;
+  f /= 0.155;
+  float val=floor(clamp(uValue,0.,1.)*100.0+0.5);
   float d0=floor(val/100.0), d1=floor(mod(val,100.0)/10.0), d2=mod(val,10.0);
-  vec2 p = (uv - vec2(0.0, 0.30))/0.165;
-  float m = 0.0;
-  m = max(m, digit7(p-vec2(-1.05,0.), d0));
-  m = max(m, digit7(p-vec2( 0.0 ,0.), d1));
-  m = max(m, digit7(p-vec2( 1.05,0.), d2));
-  vec3 c = vec3(1.0, 0.45, 0.07);
-  return c*m*2.2 + c*m*m*1.2;
+  float m=0.0;
+  m=max(m,digit7(f-vec2(-1.02,0.),d0));
+  m=max(m,digit7(f-vec2( 0.00,0.),d1));
+  m=max(m,digit7(f-vec2( 1.02,0.),d2));
+  float faceEdge=max(abs(f.x)/2.0,abs(f.y));
+  return m*(1.0-smoothstep(1.34,1.62,faceEdge));
 }
 
 // ---------- 着色 ----------
@@ -291,15 +321,21 @@ vec3 shadeCube(vec3 p, vec3 rd, vec3 n){
   vec2 uvR = mix(CUBE_C.xy, uvC, 1.028);
   vec2 uvB = mix(CUBE_C.xy, uvC, 0.972);
   vec3 refr;
-  refr.g = background(uvC).g           + digitsLayer(uvC).g;
-  refr.r = background(uvR).r           + digitsLayer(uvR).r;
-  refr.b = background(uvB).b           + digitsLayer(uvB).b;
-  // 烟色玻璃衰减 + 内部彩色细丝
+  refr.g = background(uvC).g;
+  refr.r = background(uvR).r;
+  refr.b = background(uvB).b;
+  // Smoked glass with restrained aurora filaments instead of duplicate digits.
   vec3 qIn = cubeLocal(p);
   float fil = fbm(qIn.xy*7.0 + qIn.zx*3.0);
   vec3 rainbow = 0.5+0.5*cos(6.283*(vec3(0.0,0.33,0.67)+fil*2.0+t*3.0));
   refr *= vec3(0.56,0.59,0.62);
-  refr += rainbow * 0.06 * (0.3+0.7*fre);
+  float energy = smoothstep(0.0,1.0,clamp(uValue,0.0,1.0));
+  float ribbon = pow(1.0-abs(sin(qIn.x*18.0+qIn.y*13.0+qIn.z*9.0+uTime*1.35)), 12.0);
+  float core = exp(-dot(qIn,qIn)*mix(38.0,14.0,energy));
+  float pulse = 0.78 + 0.22*sin(uTime*2.15);
+  refr += rainbow * ribbon * mix(0.07+0.04*fre,0.12+0.08*fre,energy);
+  refr += vec3(1.0,0.16,0.02) * core * (mix(0.08,0.42,energy)*pulse);
+  refr += vec3(1.0,0.58,0.20) * core*core * (mix(0.025,0.20,energy)*pulse);
   // 反射
   vec3 refl = envLight(reflect(rd,n));
   vec3 col = mix(refr, refl, F);
@@ -312,6 +348,10 @@ vec3 shadeCube(vec3 p, vec3 rd, vec3 n){
   // 边缘棱镜色
   float edge = smoothstep(0.55,1.0,fre);
   col += (0.5+0.5*cos(6.283*(fre*2.2+vec3(0.0,0.33,0.67))))*edge*0.12;
+  // Emissive seven-segment ink on each face, still visible through the glass body.
+  float faceInk=cubeFaceDigits(cubeLocal(p));
+  col += vec3(1.0,0.34,0.055)*faceInk*(1.45+fre);
+  col += vec3(1.0,0.08,0.015)*faceInk*faceInk*0.55;
   if(col.r != col.r || col.g != col.g || col.b != col.b) col = vec3(0.02); // NaN 兜底
   return col;
 }
@@ -333,10 +373,10 @@ vec3 shadeGel(vec3 p, vec3 rd, vec3 n){
   vec2 ruv = p.xy + nn.xy*0.35;
   vec3 base = gridLayer(ruv)*0.75 + vec3(0.020,0.021,0.024);
   // 褶皱凹陷上色（沟壑更暗、棱脊更亮）
-  base *= 0.62 + 0.65*crease;
+  base *= 0.50 + 0.72*crease;
   // 薄膜虹彩
   vec3 film = 0.5+0.5*cos(6.283*(vec3(0.0,0.33,0.67) + (1.0-ndv)*1.6 + f0*2.2));
-  base += film * (crease*0.55+0.10) * 0.07;
+  base += film * (crease*0.65+0.12) * 0.095;
   // 光照
   vec3 L1 = normalize(vec3(-0.35,0.8,0.5));
   float sp1 = pow(max(dot(reflect(rd,nn),L1),0.),120.)*2.2;
@@ -347,7 +387,9 @@ vec3 shadeGel(vec3 p, vec3 rd, vec3 n){
   // 顶部暖色反光（仪表盘橙）
   col += vec3(1.0,0.45,0.12) * pow(max(nn.y,0.),3.0) * 0.06;
   // 按压处透光发热
-  col += vec3(1.0,0.5,0.18) * dg * 0.55;
+  float playX=mix(-0.615,0.615,clamp(uValue,0.,1.));
+  float playGlow=exp(-42.0*(b.x-playX)*(b.x-playX));
+  col += vec3(1.0,0.5,0.18) * (dg*0.55 + playGlow*(0.07+uDown*0.24));
   return col;
 }
 
@@ -371,20 +413,20 @@ vec3 uiLayer(vec2 uv, vec3 col){
   col += vec3(0.45)*tick*0.8;
   // 播放头三角
   vec2 tp = uv - vec2(px, trackY+0.030);
-  float w=0.040, h=0.062;
+  float w=0.036, h=0.056;
   float dtri = sdTri(tp, vec2(-w,h*0.5), vec2(w,h*0.5), vec2(0.0,-h*0.5));
   float hot = clamp(uDown*0.65+0.35,0.,1.);
   float fill = 1.0-smoothstep(0.0,0.006,dtri);
   col = mix(col, mix(org*1.5, vec3(1.0,0.75,0.35), hot*0.5), fill);
   col += org*0.8*hot*exp(-max(dtri,0.0)*26.0);
   // 四角括号
-  vec2 cN = abs(uv - vec2(0.0,-0.615)) - vec2(0.885,0.195);
+  vec2 cN = abs(uv - vec2(0.0,-0.730));
   float bd = 1e3;
-  bd = min(bd, sdSeg(cN, vec2(0.885,0.195), vec2(0.835,0.195)));
-  bd = min(bd, sdSeg(cN, vec2(0.885,0.195), vec2(0.885,0.145)));
+  bd = min(bd, sdSeg(cN, vec2(0.925,0.205), vec2(0.865,0.205)));
+  bd = min(bd, sdSeg(cN, vec2(0.925,0.205), vec2(0.925,0.145)));
   col += vec3(0.50,0.52,0.55)*(1.0-smoothstep(0.0025,0.005,bd))*0.9;
   // 两端黄点
-  float dy = length(uv-vec2(0.955,-0.615));
+  float dy = length(uv-vec2(0.955,-0.850));
   col += vec3(1.0,0.85,0.15)*exp(-dy*dy*90000.0)*1.6*(1.0-smoothstep(0.008,0.012,dy));
   return col;
 }
@@ -394,8 +436,8 @@ void main(){
   vec2 uv = (2.0*frag - uRes)/uRes.y;
   float zoom = min(uRes.x/uRes.y, 0.91); // 场景适配
   uv /= zoom;
-  gRotY = uTime*0.32;
-  gRotX = -0.22 + sin(uTime*0.21)*0.07 + uPoke;
+  gRotY = 0.52 + uTime*0.32 + uRot.x;
+  gRotX = 0.38 + sin(uTime*0.21)*0.07 + uPoke + uRot.y;
 
   // 正交：射线互相平行
   vec3 ro = vec3(uv, 3.3);
@@ -419,6 +461,11 @@ void main(){
   } else {
     col = background(uv);
   }
+  // A restrained warm bloom makes the illuminated core feel visible through the shell.
+  vec2 haloP = uv-CUBE_C.xy;
+  float halo = exp(-dot(haloP,haloP)*10.0) * (0.78+0.22*sin(uTime*2.15));
+  float haloEnergy = smoothstep(0.0,1.0,clamp(uValue,0.0,1.0));
+  col += vec3(1.0,0.10,0.012)*halo*mix(0.012,0.055,haloEnergy);
   col = uiLayer(uv, col);
 
   // 后期
@@ -427,7 +474,7 @@ void main(){
   col *= 1.0 - 0.28*length(uv*vec2(0.7,1.0)-vec2(0.0,0.15));
   col += (hash21(frag+uTime)*2.0-1.0)*0.008;
   // 边框
-  float frame = max(smoothstep(0.925*zoom,0.955*zoom,abs(uv.x)), smoothstep(0.965*zoom,0.985*zoom,abs(uv.y)));
+  float frame = max(smoothstep(0.95,0.985,abs(uv.x)), smoothstep(0.98,1.02,abs(uv.y)));
   col *= 1.0-frame;
   gl_FragColor = vec4(col, 1.0);
 }
@@ -461,7 +508,7 @@ const aP = gl.getAttribLocation(prog,'aP');
 gl.enableVertexAttribArray(aP);
 gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
 const U = {};
-for(const n of ['uRes','uTime','uValue','uPoke','uDown','uDbg','uDents']) U[n]=gl.getUniformLocation(prog,n);
+for(const n of ['uRes','uTime','uValue','uPoke','uRot','uDown','uDbg','uDents']) U[n]=gl.getUniformLocation(prog,n);
 
 // ---------- 物理与交互 ----------
 const N_DENT = 8;
@@ -469,9 +516,12 @@ const dents = Array.from({length:N_DENT},()=>({x:0,y:0,s:0,v:0,on:false}));
 let value=0, target=0, valueVel=0;
 let poke=0, pokeVel=0;
 let mode=null, dentIdx=1;
-const TRACK_Y=-0.62, X0=-0.615, X1=0.615;
+let dragYaw=0, dragPitch=0, dragDistance=0, lastPointerX=0, lastPointerY=0;
+const TRACK_Y=-0.73, X0=-0.615, X1=0.615;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const urlParams = new URLSearchParams(location.search);
+const demoMode = urlParams.get('demo') === '1';
+const demoValueParam = Number(urlParams.get('demoValue'));
 
 function toUV(e){
   const r = canvas.getBoundingClientRect();
@@ -479,14 +529,15 @@ function toUV(e){
   const zoom = Math.min(r.width/r.height, 0.91);
   return [ ((2*x - r.width)/r.height)/zoom, ((r.height - 2*y)/r.height)/zoom ];
 }
-let isDown=0, hoverPlay=false;
+let isDown=0, hoverPlay=false, hoverCube=false;
 
 canvas.addEventListener('pointerdown', e=>{
   canvas.setPointerCapture(e.pointerId);
   const [x,y]=toUV(e); isDown=1;
-  if(Math.hypot(x, y-0.30) < 0.36){
-    mode='poke'; pokeVel += 2.8;
-  } else if(Math.abs(y-TRACK_Y) < 0.085 && Math.abs(x) < 0.86){
+  if(Math.hypot(x, y+0.12) < 0.36){
+    mode='rotate';
+    dragDistance=0; lastPointerX=e.clientX; lastPointerY=e.clientY;
+  } else if(Math.abs(y-TRACK_Y) < 0.120 && Math.abs(x) < 0.86){
     mode='slide';
     dents[0].on=true; dents[0].x=x; dents[0].y=TRACK_Y;
   } else if(Math.abs(y-TRACK_Y) < 0.20 && Math.abs(x) < 0.88){
@@ -498,7 +549,14 @@ canvas.addEventListener('pointerdown', e=>{
 canvas.addEventListener('pointermove', e=>{
   const [x,y]=toUV(e);
   hoverPlay = Math.abs(y-TRACK_Y)<0.10 && Math.abs(x)<0.86;
-  if(mode==='slide'){
+  hoverCube = Math.hypot(x, y+0.12)<0.36;
+  if(mode==='rotate'){
+    const dx=e.clientX-lastPointerX, dy=e.clientY-lastPointerY;
+    dragYaw += dx*0.009;
+    dragPitch = Math.max(-0.80, Math.min(0.65, dragPitch+dy*0.008));
+    dragDistance += Math.hypot(dx,dy);
+    lastPointerX=e.clientX; lastPointerY=e.clientY;
+  } else if(mode==='slide'){
     target = Math.min(1, Math.max(0, (x-X0)/(X1-X0)));
     dents[0].x = x; dents[0].y = TRACK_Y;
   } else if(mode==='dent'){
@@ -509,6 +567,7 @@ canvas.addEventListener('pointermove', e=>{
   }
 });
 window.addEventListener('pointerup', ()=>{
+  if(mode==='rotate' && dragDistance<4) pokeVel += 2.8;
   isDown=0;
   for(const d of dents) d.on=false;
   mode=null;
@@ -534,9 +593,19 @@ function frame(now){
   const dt = Math.min(0.033, (now-last)/1000); last=now;
   const time = reduceMotion ? 5.0 : now/1000 + parseFloat(urlParams.get('t')||'0');
 
+  // README recording mode: animate the same progress state used by the pointer slider.
+  if(demoMode){
+    const phase = (time*0.42) % (Math.PI*2);
+    const sweep = phase < Math.PI ? phase/Math.PI : 2.0-phase/Math.PI;
+    target = Number.isFinite(demoValueParam) ? Math.max(0, Math.min(1, demoValueParam)) : sweep;
+    dragYaw = 0.22*Math.sin(time*0.26);
+    dragPitch = 0.08*Math.sin(time*0.33);
+  }
+
   // 数值弹簧（带轻微过冲的果冻感）
   const acc = (target-value)*160 - valueVel*11;
   valueVel += acc*dt; value += valueVel*dt;
+  if(demoMode && Number.isFinite(demoValueParam)){ value=target; valueVel=0; }
   if(Math.abs(value-target)<0.0004 && Math.abs(valueVel)<0.001){ value=target; valueVel=0; }
 
   // 戳一下的弹簧回正
@@ -561,13 +630,15 @@ function frame(now){
   gl.uniform1f(U.uTime, time);
   gl.uniform1f(U.uValue, Math.min(1,Math.max(0,value)));
   gl.uniform1f(U.uPoke, reduceMotion?0:Math.max(-0.6,Math.min(0.6,poke)));
-  gl.uniform1f(U.uDown, isDown && (mode==='slide') ? 1.0 : (isDown?0.55:0.0));
+  gl.uniform2f(U.uRot, dragYaw, dragPitch);
+  const demoDown = demoMode ? (Number.isFinite(demoValueParam) && demoValueParam <= 0.01 ? 0.0 : 1.0) : 0.0;
+  gl.uniform1f(U.uDown, demoMode ? demoDown : (isDown && (mode==='slide') ? 1.0 : (isDown?0.55:0.0)));
   gl.uniform1f(U.uDbg, parseFloat(urlParams.get('dbg')||'0'));
   gl.uniform4fv(U.uDents, flat);
   gl.drawArrays(gl.TRIANGLES,0,3);
 
   valEl.textContent = String(Math.round(Math.min(1,Math.max(0,value))*100)).padStart(3,'0');
-  canvas.style.cursor = isDown ? 'grabbing' : (hoverPlay ? 'grab' : 'default');
+  canvas.style.cursor = isDown ? 'grabbing' : ((hoverPlay || hoverCube) ? 'grab' : 'default');
   frameCount++;
   if(!maxFrames || frameCount < maxFrames) requestAnimationFrame(frame);
 }
