@@ -4,7 +4,7 @@
 
 [在线体验 · GitHub Pages](https://jdb156158.github.io/InternetSpeed/gel-glass.html)
 
-![Gel Glass demo](assets/gel-glass-demo.gif)
+[![Gel Glass demo](assets/gel-glass-demo.gif)](https://jdb156158.github.io/InternetSpeed/gel-glass.html)
 
 ## 功能
 
