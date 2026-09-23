@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>凝胶玻璃 · Gel Glass</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#050506; }
+  #gl { width:100vw; height:100vh; display:block; touch-action:none; }
+  .hud {
+    position:fixed; font-family:ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color:rgba(235,235,240,.38); letter-spacing:.14em; font-size:10px;
+    user-select:none; pointer-events:none; text-transform:uppercase;
+  }
+  #tl { top:18px; left:22px; line-height:1.8; }
+  #tl b { color:rgba(255,150,50,.75); font-weight:600; }
+  #br { bottom:16px; right:22px; text-align:right; }
+  #val {
+    position:fixed; right:22px; top:18px; font-family:ui-monospace,"SF Mono",Menlo,monospace;
+    color:rgba(255,140,40,.8); font-size:12px; letter-spacing:.3em; user-select:none; pointer-events:none;
+  }
+  #err { position:fixed; inset:0; display:none; place-items:center; color:#f66; font:14px monospace; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div class="hud" id="tl"><b>GEL GLASS</b><br>shader · 2d/3d · realtime</div>
+<div class="hud" id="br">拖动滑块 · 按压凝胶 · 点按立方体</div>
+<div id="val">000</div>
+<div id="err"></div>
+<script>
+"use strict";
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', {antialias:false, alpha:false, preserveDrawingBuffer:true, powerPreference:'high-performance'});
+if (!gl) { document.getElementById('err').style.display='grid'; document.getElementById('err').textContent='需要 WebGL 支持'; throw new Error('no webgl'); }
+gl.getExtension('OES_standard_derivatives');
+
+const VERT = `
+attribute vec2 aP; void main(){ gl_Position = vec4(aP,0.,1.); }
+`;
+
+const FRAG = `
+#extension GL_OES_standard_derivatives : enable
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uValue;    // 平滑后的 0..1
+uniform float uPoke;     // 立方体被戳的角度
+uniform float uDown;     // 播放头拖拽热度
+uniform float uDbg;
+uniform vec4  uDents[8]; // x, y, strength, unused
+
+#define PI 3.14159265
+
+// 正交相机：世界 xy 即屏幕坐标
+const vec3 CUBE_C = vec3(0.0, 0.30, 0.0);
+const vec3 CUBE_B = vec3(0.27);
+const float CUBE_R = 0.07;
+const vec3 BAR_C  = vec3(0.0, -0.62, 0.0);
+const vec3 BAR_B  = vec3(0.80, 0.105, 0.105);
+const float BAR_R = 0.095;
+const vec2 G_C = vec2(0.0, 0.40);
+
+float gRotY, gRotX; // 立方体旋转（全局，供 map 与 local 变换共用）
+
+mat2 rot(float a){ float c=cos(a), s=sin(a); return mat2(c,-s,s,c); }
+
+float hash21(vec2 p){ p = fract(p*vec2(234.34,435.345)); p += dot(p,p+34.23); return fract(p.x*p.y); }
+float vnoise(vec2 p){
+  vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x), mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x), f.y);
+}
+float fbm(vec2 p){
+  float v=0., a=0.5;
+  for(int i=0;i<4;i++){ v+=a*vnoise(p); p=p*2.03+7.3; a*=0.5; }
+  return v;
+}
+
+// ---------- SDF ----------
+float sdRoundBox(vec3 p, vec3 b, float r){
+  vec3 q = abs(p)-b+r;
+  return length(max(q,0.)) + min(max(q.x,max(q.y,q.z)),0.) - r;
+}
+float sdSeg(vec2 p, vec2 a, vec2 b){
+  vec2 pa=p-a, ba=b-a;
+  float h=clamp(dot(pa,ba)/dot(ba,ba),0.,1.);
+  return length(pa-ba*h);
+}
+float sdTri(vec2 p, vec2 p0, vec2 p1, vec2 p2){
+  vec2 e0=p1-p0, e1=p2-p1, e2=p0-p2;
+  vec2 v0=p-p0, v1=p-p1, v2=p-p2;
+  vec2 cl0=v0-e0*clamp(dot(v0,e0)/dot(e0,e0),0.,1.);
+  vec2 cl1=v1-e1*clamp(dot(v1,e1)/dot(e1,e1),0.,1.);
+  vec2 cl2=v2-e2*clamp(dot(v2,e2)/dot(e2,e2),0.,1.);
+  return sqrt(min(dot(cl0,cl0),min(dot(cl1,cl1),dot(cl2,cl2))));
+}
+
+// 凝胶凹痕（xy 平面上的高斯坑）
+float dentField(vec3 b){
+  float d=0.;
+  for(int i=0;i<8;i++){
+    vec4 D=uDents[i];
+    vec2 q=b.xy - D.xy;
+    d += D.z * exp(-26.*dot(q,q));
+  }
+  return d;
+}
+
+vec2 map(vec3 p){
+  vec3 q = p - CUBE_C;
+  q.xz = rot(gRotY) * q.xz;
+  q.yz = rot(gRotX) * q.yz;
+  float dc = sdRoundBox(q, CUBE_B, CUBE_R);
+  vec3 b = p - BAR_C;
+  float db = sdRoundBox(b, BAR_B, BAR_R) + dentField(b)*0.11;
+  return dc<db ? vec2(dc,1.0) : vec2(db,2.0);
+}
+vec3 cubeLocal(vec3 w){
+  vec3 q = w - CUBE_C;
+  q.xz = rot(gRotY) * q.xz;
+  q.yz = rot(gRotX) * q.yz;
+  return q;
+}
+vec3 calcNormal(vec3 p){
+  const vec2 e = vec2(0.0015, 0.0);
+  return normalize(vec3(
+    map(p+e.xyy).x - map(p-e.xyy).x,
+    map(p+e.yxy).x - map(p-e.yxy).x,
+    map(p+e.yyx).x - map(p-e.yyx).x));
+}
+
+// ---------- 背景（场景 uv：网格 + 仪表盘） ----------
+vec3 gridLayer(vec2 uv){
+  vec3 col = vec3(0.026,0.027,0.031);
+  vec2 g = uv/0.115;
+  vec2 gf = abs(fract(g)-0.5)/fwidth(g);
+  float line = 1.0 - min(min(gf.x,gf.y),1.0);
+  col += vec3(0.10,0.105,0.12) * line * 0.55;
+  return col;
+}
+float tickField(vec2 p, float n, float majorEvery, float r0, float r1, float w){
+  float r = length(p);
+  float a = atan(p.y, p.x);
+  float u = (PI - a)/PI;             // 0=左, 1=右
+  if(u<0.||u>1.) return 0.;
+  float uu = u*n;
+  float k = floor(uu+0.5);
+  float isMajor = 1.0 - step(0.5, fract(k/majorEvery));
+  float rr0 = mix(r0, r0-0.012, isMajor);
+  float rr1 = mix(r1, r1+0.024, isMajor);
+  float dAng = abs(uu-k)/n*PI*r;
+  float inR = smoothstep(rr0-0.002, rr0, r)*(1.-smoothstep(rr1, rr1+0.002, r));
+  float inW = 1.-smoothstep(w*0.5, w, dAng);
+  return inR*inW*mix(0.7,1.0,isMajor);
+}
+vec3 gaugeLayer(vec2 uv){
+  vec2 p = uv - G_C;
+  vec3 acc = vec3(0);
+  float r = length(p);
+  float a = atan(p.y, p.x);
+  float u = clamp((PI - a)/PI, 0., 1.);
+  float v = clamp(uValue, 0., 1.);
+  if(p.y > -0.05 && r < 0.95){
+    vec3 gray = vec3(0.42,0.44,0.47);
+    vec3 org  = vec3(1.0, 0.52, 0.10);
+    // 刻度
+    float tm = tickField(p, 50., 5., 0.665, 0.712, 0.0035);
+    float filled = step(u, v);
+    acc += gray * tm * (1.-filled) * 0.9;
+    acc += org  * tm * filled * 1.4;
+    // 进度弧（外亮 + 内淡）+ 全周淡弧
+    float arcBand = abs(r-0.545);
+    float aOn = step(u, v);
+    float arc = exp(-arcBand*arcBand*9000.0) * aOn * step(0.0,p.y+0.02);
+    acc += org * arc * 1.3;
+    float arcBand2 = abs(r-0.44);
+    acc += org * exp(-arcBand2*arcBand2*16000.0) * aOn * 0.55 * step(0.0,p.y+0.02);
+    // 淡全弧
+    acc += gray * exp(-arcBand*arcBand*16000.0) * 0.16 * step(0.0,p.y+0.02);
+    // 指针
+    float du = abs(u - v)*PI*r;
+    float needle = exp(-du*du*260000.0) * smoothstep(0.06,0.12,r)*(1.-smoothstep(0.52,0.60,r));
+    acc += org * needle * (1.3 - (r-0.1)) * mix(0.25, 1.0, v);
+    // 中心点
+    acc += org * exp(-r*r*4000.0)*0.5 * step(0.0,p.y);
+    // 辉光
+    acc += org * 0.10 * aOn * exp(-abs(r-0.5)*6.0) * step(0.0,p.y);
+  }
+  return acc;
+}
+vec3 background(vec2 uv){
+  vec3 col = gridLayer(uv);
+  col += gaugeLayer(uv);
+  // 暗角（限制不产生负色）
+  col *= max(0.0, 1.0 - 0.45*dot(uv-vec2(0.,0.05), uv-vec2(0.,0.05)));
+  return col;
+}
+
+// ---------- 七段数码管 ----------
+float segGlow(vec2 p, vec2 c, vec2 h){
+  vec2 d = abs(p-c)-h;
+  return length(max(d,0.)) + min(max(d.x,d.y),0.);
+}
+float digit7(vec2 p, float d){
+  p.x += p.y*0.10; // 斜体
+  bool a=false,b=false,c=false,dd=false,e=false,f=false,g=false;
+  if(d<0.5){a=true;b=true;c=true;dd=true;e=true;f=true;}
+  else if(d<1.5){b=true;c=true;}
+  else if(d<2.5){a=true;b=true;g=true;e=true;dd=true;}
+  else if(d<3.5){a=true;b=true;g=true;c=true;dd=true;}
+  else if(d<4.5){f=true;g=true;b=true;c=true;}
+  else if(d<5.5){a=true;f=true;g=true;c=true;dd=true;}
+  else if(d<6.5){a=true;f=true;g=true;c=true;dd=true;e=true;}
+  else if(d<7.5){a=true;b=true;c=true;}
+  else if(d<8.5){a=true;b=true;c=true;dd=true;e=true;f=true;g=true;}
+  else {a=true;b=true;c=true;dd=true;f=true;g=true;}
+  float w=0.075, m=1e3;
+  if(a) m=min(m,segGlow(p,vec2(0.0, 0.46),vec2(0.15,w)));
+  if(g) m=min(m,segGlow(p,vec2(0.0, 0.0 ),vec2(0.15,w)));
+  if(dd)m=min(m,segGlow(p,vec2(0.0,-0.46),vec2(0.15,w)));
+  if(f) m=min(m,segGlow(p,vec2(-0.24,0.23),vec2(w,0.16)));
+  if(b) m=min(m,segGlow(p,vec2( 0.24,0.23),vec2(w,0.16)));
+  if(e) m=min(m,segGlow(p,vec2(-0.24,-0.23),vec2(w,0.16)));
+  if(c) m=min(m,segGlow(p,vec2( 0.24,-0.23),vec2(w,0.16)));
+  return 1.0 - smoothstep(0.0, 0.03, m);
+}
+vec3 digitsLayer(vec2 uv){
+  float val = floor(clamp(uValue,0.,1.)*100.0+0.5);
+  float d0=floor(val/100.0), d1=floor(mod(val,100.0)/10.0), d2=mod(val,10.0);
+  vec2 p = (uv - vec2(0.0, 0.30))/0.165;
+  float m = 0.0;
+  m = max(m, digit7(p-vec2(-1.05,0.), d0));
+  m = max(m, digit7(p-vec2( 0.0 ,0.), d1));
+  m = max(m, digit7(p-vec2( 1.05,0.), d2));
+  vec3 c = vec3(1.0, 0.45, 0.07);
+  return c*m*2.2 + c*m*m*1.2;
+}
+
+// ---------- 着色 ----------
+vec3 envLight(vec3 rd){
+  vec3 sky = mix(vec3(0.03,0.03,0.035), vec3(0.20,0.22,0.26), smoothstep(-0.6,1.0,rd.y));
+  sky += vec3(0.85,0.88,0.95)*pow(max(dot(rd,normalize(vec3(0.35,0.85,0.35))),0.),22.)*0.45;
+  sky += vec3(1.0,0.5,0.15)*pow(max(dot(rd,normalize(vec3(-0.5,0.15,0.8))),0.),30.)*0.20;
+  return sky;
+}
+// 正交相机：出射方向打到 z=-2 背景板取场景 uv
+vec2 backdropSample(vec3 pEx, vec3 rdo){
+  float tb = (-2.0 - pEx.z)/rdo.z;
+  return clamp(pEx.xy + rdo.xy*tb, vec2(-1.6,-1.2), vec2(1.6,1.2));
+}
+float exitSDF(vec3 w){
+  return sdRoundBox(cubeLocal(w), CUBE_B-0.002, CUBE_R*0.9);
+}
+vec3 shadeCube(vec3 p, vec3 rd, vec3 n){
+  float ndv = max(dot(-rd,n), 0.0);
+  float fre = pow(1.0-ndv, 5.0);
+  float F = 0.06 + 0.94*fre;
+  // 进入折射
+  vec3 rdc = refract(rd, n, 1.0/1.45);
+  if(dot(rdc,rdc) < 0.001) rdc = reflect(rd, n);
+  // 内部行进至出射面（先深入内部再步进，最后二分收敛到界面）
+  float tPrev = 0.0; float t = 0.05;
+  for(int i=0;i<32;i++){
+    float d = exitSDF(p + rdc*t);
+    if(d > 0.0) break;
+    tPrev = t;
+    t += max(0.008, -d);
+  }
+  for(int i=0;i<6;i++){
+    float tm = 0.5*(tPrev+t);
+    if(exitSDF(p + rdc*tm) < 0.0) tPrev = tm; else t = tm;
+  }
+  vec3 pEx = p + rdc*t;
+  // 出射面法线
+  vec2 e = vec2(0.0015,0.0);
+  vec3 n2 = normalize(vec3(
+    exitSDF(pEx+e.xyy)-exitSDF(pEx-e.xyy),
+    exitSDF(pEx+e.yxy)-exitSDF(pEx-e.yxy),
+    exitSDF(pEx+e.yyx)-exitSDF(pEx-e.yyx)));
+  // 出射：显式 Snell 判别式（refract 在 TIR 时按规范未定义，可能返回 NaN）
+  float ci = clamp(dot(n2, rdc), 0.0, 1.0);
+  float kk = 1.0 - 1.45*1.45*(1.0 - ci*ci);
+  vec3 rdo;
+  if(kk < 0.0) rdo = reflect(rdc, n2);
+  else rdo = refract(rdc, -n2, 1.45);
+  rdo = normalize(rdo);
+  if(rdo.z > -0.05) rdo = vec3(rdo.x, rdo.y, -0.05);
+  // 色散：三个通道以微小倍率采样
+  vec2 uvC = backdropSample(pEx, rdo);
+  vec2 uvR = mix(CUBE_C.xy, uvC, 1.028);
+  vec2 uvB = mix(CUBE_C.xy, uvC, 0.972);
+  vec3 refr;
+  refr.g = background(uvC).g           + digitsLayer(uvC).g;
+  refr.r = background(uvR).r           + digitsLayer(uvR).r;
+  refr.b = background(uvB).b           + digitsLayer(uvB).b;
+  // 烟色玻璃衰减 + 内部彩色细丝
+  vec3 qIn = cubeLocal(p);
+  float fil = fbm(qIn.xy*7.0 + qIn.zx*3.0);
+  vec3 rainbow = 0.5+0.5*cos(6.283*(vec3(0.0,0.33,0.67)+fil*2.0+t*3.0));
+  refr *= vec3(0.56,0.59,0.62);
+  refr += rainbow * 0.06 * (0.3+0.7*fre);
+  // 反射
+  vec3 refl = envLight(reflect(rd,n));
+  vec3 col = mix(refr, refl, F);
+  if(uDbg > 1.5) return refl;
+  if(uDbg > 0.5) return refr;
+  // 高光
+  vec3 L1 = normalize(vec3(-0.4,0.75,0.55));
+  col += vec3(1.0)*pow(max(dot(reflect(rd,n),L1),0.),140.)*1.6;
+  col += vec3(1.0,0.7,0.4)*pow(max(dot(reflect(rd,n),normalize(vec3(0.6,0.3,0.8))),0.),60.)*0.35;
+  // 边缘棱镜色
+  float edge = smoothstep(0.55,1.0,fre);
+  col += (0.5+0.5*cos(6.283*(fre*2.2+vec3(0.0,0.33,0.67))))*edge*0.12;
+  if(col.r != col.r || col.g != col.g || col.b != col.b) col = vec3(0.02); // NaN 兜底
+  return col;
+}
+
+vec3 shadeGel(vec3 p, vec3 rd, vec3 n){
+  vec3 b = p - BAR_C;
+  float dg = dentField(b);
+  // 布料褶皱法线扰动
+  vec2 wuv = b.xy*9.0 + vec2(0.0, 2.7);
+  float e = 0.06;
+  float f0=fbm(wuv), fx=fbm(wuv+vec2(e,0.)), fy=fbm(wuv+vec2(0.,e));
+  float crease = 1.0-abs(f0-0.5)*2.0;
+  vec3 nn = normalize(n + vec3((fx-f0),(fy-f0),0.0)*(0.45+dg*1.6));
+  // 细织纹
+  float weave = sin(b.x*260.0)*sin(b.y*260.0);
+  nn = normalize(nn + vec3(weave*0.015));
+  float ndv = max(dot(-rd,nn),0.0);
+  // 体透视：透过凝胶看到扭曲网格
+  vec2 ruv = p.xy + nn.xy*0.35;
+  vec3 base = gridLayer(ruv)*0.75 + vec3(0.020,0.021,0.024);
+  // 褶皱凹陷上色（沟壑更暗、棱脊更亮）
+  base *= 0.62 + 0.65*crease;
+  // 薄膜虹彩
+  vec3 film = 0.5+0.5*cos(6.283*(vec3(0.0,0.33,0.67) + (1.0-ndv)*1.6 + f0*2.2));
+  base += film * (crease*0.55+0.10) * 0.07;
+  // 光照
+  vec3 L1 = normalize(vec3(-0.35,0.8,0.5));
+  float sp1 = pow(max(dot(reflect(rd,nn),L1),0.),120.)*2.2;
+  float sp2 = pow(max(dot(reflect(rd,nn),normalize(vec3(0.7,0.25,0.6))),0.),50.)*0.35;
+  float sheen = pow(max(dot(reflect(rd,nn),L1),0.),18.)*0.20;
+  float rim = pow(1.0-ndv,3.0)*0.30;
+  vec3 col = base + vec3(sp1+sheen) + vec3(0.9,0.95,1.0)*sp2 + vec3(0.5)*rim;
+  // 顶部暖色反光（仪表盘橙）
+  col += vec3(1.0,0.45,0.12) * pow(max(nn.y,0.),3.0) * 0.06;
+  // 按压处透光发热
+  col += vec3(1.0,0.5,0.18) * dg * 0.55;
+  return col;
+}
+
+// ---------- 屏幕 UI 层 ----------
+vec3 uiLayer(vec2 uv, vec3 col){
+  vec3 org = vec3(1.0,0.52,0.10);
+  float trackY = BAR_C.y;
+  float x0=-0.615, x1=0.615;
+  float px = mix(x0,x1,clamp(uValue,0.,1.));
+  // 轨道线
+  float seg = step(x0,uv.x)*step(uv.x,x1);
+  float dl = abs(uv.y-trackY);
+  float lineM = seg*(1.0-smoothstep(0.004,0.007,dl));
+  float prog = step(uv.x,px);
+  col = mix(col, vec3(0.62,0.64,0.66), lineM*(1.0-prog*0.8));
+  col += org*lineM*prog*1.6;
+  col += org*0.5*exp(-dl*dl*8000.0)*seg*prog;
+  // 轨道下小刻度
+  float tu = (uv.x-x0)/((x1-x0)/10.0);
+  float tick = seg*step(abs(uv.y-(trackY-0.038)),0.014)*(1.0-smoothstep(0.012,0.02,abs(fract(tu)-0.5)*((x1-x0)/10.0)));
+  col += vec3(0.45)*tick*0.8;
+  // 播放头三角
+  vec2 tp = uv - vec2(px, trackY+0.030);
+  float w=0.040, h=0.062;
+  float dtri = sdTri(tp, vec2(-w,h*0.5), vec2(w,h*0.5), vec2(0.0,-h*0.5));
+  float hot = clamp(uDown*0.65+0.35,0.,1.);
+  float fill = 1.0-smoothstep(0.0,0.006,dtri);
+  col = mix(col, mix(org*1.5, vec3(1.0,0.75,0.35), hot*0.5), fill);
+  col += org*0.8*hot*exp(-max(dtri,0.0)*26.0);
+  // 四角括号
+  vec2 cN = abs(uv - vec2(0.0,-0.615)) - vec2(0.885,0.195);
+  float bd = 1e3;
+  bd = min(bd, sdSeg(cN, vec2(0.885,0.195), vec2(0.835,0.195)));
+  bd = min(bd, sdSeg(cN, vec2(0.885,0.195), vec2(0.885,0.145)));
+  col += vec3(0.50,0.52,0.55)*(1.0-smoothstep(0.0025,0.005,bd))*0.9;
+  // 两端黄点
+  float dy = length(uv-vec2(0.955,-0.615));
+  col += vec3(1.0,0.85,0.15)*exp(-dy*dy*90000.0)*1.6*(1.0-smoothstep(0.008,0.012,dy));
+  return col;
+}
+
+void main(){
+  vec2 frag = gl_FragCoord.xy;
+  vec2 uv = (2.0*frag - uRes)/uRes.y;
+  float zoom = min(uRes.x/uRes.y, 0.91); // 场景适配
+  uv /= zoom;
+  gRotY = uTime*0.32;
+  gRotX = -0.22 + sin(uTime*0.21)*0.07 + uPoke;
+
+  // 正交：射线互相平行
+  vec3 ro = vec3(uv, 3.3);
+  vec3 rd = vec3(0.0, 0.0, -1.0);
+
+  // raymarch
+  float t = 0.0; float id = 0.0;
+  for(int i=0;i<90;i++){
+    vec3 p = ro + rd*t;
+    vec2 h = map(p);
+    if(h.x < 0.0012){ id = h.y; break; }
+    t += h.x;
+    if(t > 5.0) break;
+  }
+  vec3 col;
+  if(id > 0.5){
+    vec3 p = ro + rd*t;
+    vec3 n = calcNormal(p);
+    if(id < 1.5) col = shadeCube(p, rd, n);
+    else         col = shadeGel(p, rd, n);
+  } else {
+    col = background(uv);
+  }
+  col = uiLayer(uv, col);
+
+  // 后期
+  col = col/(1.0+col*0.35);
+  col = pow(col, vec3(0.92));
+  col *= 1.0 - 0.28*length(uv*vec2(0.7,1.0)-vec2(0.0,0.15));
+  col += (hash21(frag+uTime)*2.0-1.0)*0.008;
+  // 边框
+  float frame = max(smoothstep(0.925*zoom,0.955*zoom,abs(uv.x)), smoothstep(0.965*zoom,0.985*zoom,abs(uv.y)));
+  col *= 1.0-frame;
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    console.error(gl.getShaderInfoLog(s));
+    const el = document.getElementById('err');
+    el.style.display='grid'; el.textContent = 'Shader 编译失败: '+gl.getShaderInfoLog(s);
+    throw new Error('compile');
+  }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+  document.getElementById('err').style.display='grid';
+  document.getElementById('err').textContent='Link 失败: '+gl.getProgramInfoLog(prog);
+  throw new Error('link');
+}
+gl.useProgram(prog);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const aP = gl.getAttribLocation(prog,'aP');
+gl.enableVertexAttribArray(aP);
+gl.vertexAttribPointer(aP,2,gl.FLOAT,false,0,0);
+const U = {};
+for(const n of ['uRes','uTime','uValue','uPoke','uDown','uDbg','uDents']) U[n]=gl.getUniformLocation(prog,n);
+
+// ---------- 物理与交互 ----------
+const N_DENT = 8;
+const dents = Array.from({length:N_DENT},()=>({x:0,y:0,s:0,v:0,on:false}));
+let value=0, target=0, valueVel=0;
+let poke=0, pokeVel=0;
+let mode=null, dentIdx=1;
+const TRACK_Y=-0.62, X0=-0.615, X1=0.615;
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const urlParams = new URLSearchParams(location.search);
+
+function toUV(e){
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  const zoom = Math.min(r.width/r.height, 0.91);
+  return [ ((2*x - r.width)/r.height)/zoom, ((r.height - 2*y)/r.height)/zoom ];
+}
+let isDown=0, hoverPlay=false;
+
+canvas.addEventListener('pointerdown', e=>{
+  canvas.setPointerCapture(e.pointerId);
+  const [x,y]=toUV(e); isDown=1;
+  if(Math.hypot(x, y-0.30) < 0.36){
+    mode='poke'; pokeVel += 2.8;
+  } else if(Math.abs(y-TRACK_Y) < 0.085 && Math.abs(x) < 0.86){
+    mode='slide';
+    dents[0].on=true; dents[0].x=x; dents[0].y=TRACK_Y;
+  } else if(Math.abs(y-TRACK_Y) < 0.20 && Math.abs(x) < 0.88){
+    mode='dent';
+    const d=dents[dentIdx]; d.on=true; d.x=x; d.y=y;
+    dentIdx=(dentIdx%(N_DENT-1))+1;
+  }
+});
+canvas.addEventListener('pointermove', e=>{
+  const [x,y]=toUV(e);
+  hoverPlay = Math.abs(y-TRACK_Y)<0.10 && Math.abs(x)<0.86;
+  if(mode==='slide'){
+    target = Math.min(1, Math.max(0, (x-X0)/(X1-X0)));
+    dents[0].x = x; dents[0].y = TRACK_Y;
+  } else if(mode==='dent'){
+    // 移动最近的激活凹痕
+    let best=null, bd=1e9;
+    for(const d2 of dents){ if(d2.on){ const dd=(d2.x-x)*(d2.x-x)+(d2.y-y)*(d2.y-y); if(dd<bd){bd=dd;best=d2;} } }
+    if(best){ best.x=x; best.y=y; }
+  }
+});
+window.addEventListener('pointerup', ()=>{
+  isDown=0;
+  for(const d of dents) d.on=false;
+  mode=null;
+});
+window.addEventListener('keydown', e=>{
+  if(e.key==='ArrowRight') target=Math.min(1,target+0.05);
+  if(e.key==='ArrowLeft')  target=Math.max(0,target-0.05);
+});
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio||1, 1.75);
+  canvas.width = Math.floor(innerWidth*dpr);
+  canvas.height = Math.floor(innerHeight*dpr);
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+addEventListener('resize', resize); resize();
+
+const valEl = document.getElementById('val');
+const maxFrames = parseInt(urlParams.get('frames')||'0',10);
+let frameCount = 0;
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.033, (now-last)/1000); last=now;
+  const time = reduceMotion ? 5.0 : now/1000 + parseFloat(urlParams.get('t')||'0');
+
+  // 数值弹簧（带轻微过冲的果冻感）
+  const acc = (target-value)*160 - valueVel*11;
+  valueVel += acc*dt; value += valueVel*dt;
+  if(Math.abs(value-target)<0.0004 && Math.abs(valueVel)<0.001){ value=target; valueVel=0; }
+
+  // 戳一下的弹簧回正
+  const pacc = -70*poke - 5.5*pokeVel;
+  pokeVel += pacc*dt; poke += pokeVel*dt;
+
+  // 凝胶凹痕弹簧
+  for(const d of dents){
+    if(d.on){
+      d.v += (1.0-d.s)*130*dt; d.s += d.v*dt;
+    } else {
+      const a = -95*d.s - 6.5*d.v;
+      d.v += a*dt; d.s += d.v*dt;
+      if(Math.abs(d.s)<0.004 && Math.abs(d.v)<0.004){ d.s=0; d.v=0; }
+    }
+  }
+
+  const flat = new Float32Array(N_DENT*4);
+  dents.forEach((d,i)=>{ flat[i*4]=d.x; flat[i*4+1]=d.y; flat[i*4+2]=Math.max(-1.2,Math.min(1.2,d.s)); flat[i*4+3]=0; });
+
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, time);
+  gl.uniform1f(U.uValue, Math.min(1,Math.max(0,value)));
+  gl.uniform1f(U.uPoke, reduceMotion?0:Math.max(-0.6,Math.min(0.6,poke)));
+  gl.uniform1f(U.uDown, isDown && (mode==='slide') ? 1.0 : (isDown?0.55:0.0));
+  gl.uniform1f(U.uDbg, parseFloat(urlParams.get('dbg')||'0'));
+  gl.uniform4fv(U.uDents, flat);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  valEl.textContent = String(Math.round(Math.min(1,Math.max(0,value))*100)).padStart(3,'0');
+  canvas.style.cursor = isDown ? 'grabbing' : (hoverPlay ? 'grab' : 'default');
+  frameCount++;
+  if(!maxFrames || frameCount < maxFrames) requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
